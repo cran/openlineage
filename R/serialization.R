@@ -100,7 +100,15 @@
     )
   }
 
-  c(base, .ol_mapped_properties(x, mapping))
+  fields <- .ol_mapped_properties(x, mapping)
+  converters <- .ol_facet_wire_values[[class_name]]
+  for (wire_name in names(converters)) {
+    if (!is.null(fields[[wire_name]])) {
+      fields[[wire_name]] <- converters[[wire_name]](fields[[wire_name]])
+    }
+  }
+
+  c(base, fields)
 }
 
 .ol_record_fields <- function(x) {
@@ -134,14 +142,29 @@
     )
   }
 
+  if (inherits(x, "POSIXlt")) {
+    return(.ol_atomic_to_wire(as.POSIXct(x), call = call))
+  }
+
   if (is.list(x)) {
+    # A classed list (`numeric_version`, `simple.list`, a user's S3 object)
+    # would be written as a plain object or array, its class dropped.
+    if (length(setdiff(oldClass(x), "AsIs")) > 0L) {
+      .ol_wire_abort(
+        paste0("objects of class `", class(x)[[1L]], "`"),
+        call
+      )
+    }
     object <- !is.null(names(x))
+    if (object) {
+      wire_names <- .ol_validate_wire_names(names(x), call = call)
+    }
     converted <- lapply(x, .ol_to_wire, call = call)
     keep <- !vapply(converted, is.null, logical(1))
     converted <- converted[keep]
 
     if (object) {
-      names(converted) <- names(x)[keep]
+      names(converted) <- wire_names[keep]
     } else {
       names(converted) <- NULL
     }
@@ -149,15 +172,138 @@
     return(converted)
   }
 
-  if (!is.atomic(x) || anyNA(x)) {
-    .ol_abort(
-      "OpenLineage values must not contain unsupported objects or missing values.",
-      class = "openlineage_validation_error",
-      call = call
+  .ol_atomic_to_wire(x, call = call)
+}
+
+.ol_wire_abort <- function(problem, call) {
+  .ol_abort(
+    paste0("OpenLineage values must not contain ", problem, "."),
+    class = "openlineage_validation_error",
+    call = call
+  )
+}
+
+.ol_validate_wire_names <- function(x, call) {
+  if (anyNA(x) || !all(nzchar(x))) {
+    .ol_wire_abort("lists with missing or empty names", call)
+  }
+  if (anyDuplicated(x)) {
+    .ol_wire_abort("lists with repeated names", call)
+  }
+  utf8 <- .ol_as_utf8(x)
+  if (is.null(utf8)) {
+    .ol_wire_abort("names that are not valid UTF-8", call)
+  }
+
+  utf8
+}
+
+# Converts an atomic vector to the value jsonlite writes, or rejects it when
+# jsonlite would change it silently: `Inf` becoming `null`, names dropped,
+# POSIXct written without `T` or an offset.
+.ol_atomic_to_wire <- function(x, call) {
+  if (!is.atomic(x) || is.complex(x) || is.raw(x)) {
+    .ol_wire_abort("unsupported objects", call)
+  }
+  if (anyNA(x)) {
+    .ol_wire_abort("missing values", call)
+  }
+  if (!is.null(names(x))) {
+    .ol_wire_abort("named atomic vectors", call)
+  }
+
+  as_is <- inherits(x, "AsIs")
+  if (inherits(x, "POSIXt")) {
+    x <- as.POSIXct(x)
+    x <- vapply(
+      seq_along(x),
+      \(i) .ol_event_time(x[i], "value", call = call),
+      character(1)
+    )
+  } else if (inherits(x, "Date")) {
+    days <- unclass(x)
+    if (!all(is.finite(days))) {
+      .ol_wire_abort("infinite dates", call)
+    }
+    fields <- as.POSIXlt(x)
+    years <- fields$year + 1900L
+    if (any(years < 1L | years > 9999L)) {
+      .ol_wire_abort("dates outside the years 0001 to 9999", call)
+    }
+    # Not `format(x, "%Y-%m-%d")`: glibc does not pad years below 1000, so
+    # 0001-01-01 would be written as `1-01-01` on Linux.
+    x <- sprintf("%04d-%02d-%02d", years, fields$mon + 1L, fields$mday)
+  } else if (is.factor(x)) {
+    x <- as.character(x)
+  } else if (length(setdiff(oldClass(x), "AsIs")) > 0L) {
+    .ol_wire_abort(
+      paste0("objects of class `", class(x)[[1L]], "`"),
+      call
     )
   }
 
-  x
+  if (is.double(x) && !all(is.finite(x))) {
+    .ol_wire_abort("infinite numbers", call)
+  }
+  if (is.character(x)) {
+    utf8 <- .ol_as_utf8(x)
+    if (is.null(utf8)) {
+      .ol_wire_abort("text that is not valid UTF-8", call)
+    }
+    x <- utf8
+  }
+
+  if (as_is) I(x) else x
+}
+
+# Doubles are written as text before jsonlite sees them: integer-valued
+# doubles up to 2^53 exactly, others with the fewest significant digits (15
+# to 17) that read back as the same double, as Python's `repr()` does. The
+# read-back uses jsonlite's parser (C `strtod()`), as consumers do; R's own
+# `as.numeric()` is not correctly rounded for every input.
+.ol_format_double <- function(x) {
+  text <- character(length(x))
+  exact <- x == trunc(x) & abs(x) <= 2^53
+  text[exact] <- sprintf("%.0f", x[exact])
+
+  pending <- which(!exact)
+  for (digits in 15:17) {
+    if (length(pending) == 0L) {
+      break
+    }
+    candidate <- sprintf(paste0("%.", digits, "g"), x[pending])
+    # 17 significant digits always identify a double.
+    same <- if (digits == 17L) {
+      rep(TRUE, length(pending))
+    } else {
+      jsonlite::parse_json(
+        paste0("[", paste(candidate, collapse = ","), "]"),
+        simplifyVector = TRUE
+      ) ==
+        x[pending]
+    }
+    text[pending[same]] <- candidate[same]
+    pending <- pending[!same]
+  }
+
+  text
+}
+
+.ol_json_numbers <- function(x) {
+  if (is.list(x)) {
+    converted <- lapply(x, .ol_json_numbers)
+    names(converted) <- names(x)
+    return(converted)
+  }
+  if (!is.double(x)) {
+    return(x)
+  }
+
+  text <- .ol_format_double(unclass(x))
+  if (length(x) != 1L || inherits(x, "AsIs")) {
+    text <- paste0("[", paste(text, collapse = ","), "]")
+  }
+  structure(text, class = "json")
 }
 
 #' Convert an OpenLineage value to its wire representation
@@ -200,11 +346,11 @@ to_openlineage_json <- function(x, pretty = FALSE) {
   .ol_validate_flag(pretty, "pretty", call = parent.frame())
 
   as.character(jsonlite::toJSON(
-    as_openlineage_list(x),
+    .ol_json_numbers(as_openlineage_list(x)),
     auto_unbox = TRUE,
     null = "null",
     na = "null",
-    digits = NA,
+    json_verbatim = TRUE,
     pretty = pretty
   ))
 }

@@ -1,21 +1,3 @@
-http_transport_event <- function() {
-  RunEvent(
-    Run(fixture_run_id()),
-    Job("example", "http-transport-test"),
-    event_type = "START",
-    event_time = "2026-01-02T03:04:05.000Z"
-  )
-}
-
-http_mock_response <- function(status_code, request, headers = list()) {
-  httr2::response(
-    status_code = status_code,
-    url = request$url,
-    method = "POST",
-    headers = headers
-  )
-}
-
 test_that("HTTP endpoint paths are normalized", {
   cases <- list(
     c(
@@ -55,7 +37,7 @@ test_that("HTTP transport sends the expected endpoint, headers, and body", {
     captured$request <- req
     http_mock_response(201L, req)
   })
-  event <- http_transport_event()
+  event <- minimal_start_event()
   transport <- HttpTransport$new(
     "https://example.com/openlineage/",
     endpoint = "/api/v1/lineage/",
@@ -66,31 +48,29 @@ test_that("HTTP transport sends the expected endpoint, headers, and body", {
 
   result <- withVisible(transport$emit(event))
   request <- captured$request
-  headers <- .ol_http_request_headers(
-    "test-api-key",
-    c(`X-Tenant` = "analytics")
-  )
 
   expect_identical(
     request$url,
     "https://example.com/openlineage/api/v1/lineage"
   )
   expect_identical(request$method, "POST")
-  expect_identical(headers[["Authorization"]], "Bearer test-api-key")
-  expect_identical(headers[["X-Tenant"]], "analytics")
-  expect_setequal(names(request$headers), names(headers))
+  expect_identical(
+    httr2::req_get_headers(request, "reveal"),
+    list(Authorization = "Bearer test-api-key", `X-Tenant` = "analytics")
+  )
   expect_identical(request$body$content_type, "application/json")
   expect_json_semantically_equal(
     request$body$data,
-    to_openlineage_json(event)
+    read_json_fixture("minimal-start.json")
   )
   expect_identical(request$options$timeout_ms, 2500)
+  expect_identical(request$options$followlocation, 0L)
   expect_null(request$options$ssl_verifypeer)
   expect_identical(result$value, event)
   expect_identical(result$visible, FALSE)
 })
 
-test_that("custom authorization headers are supported and redacted", {
+test_that("custom headers are sent and redacted (#33)", {
   captured <- new.env(parent = emptyenv())
   httr2::local_mocked_responses(function(req) {
     captured$request <- req
@@ -98,23 +78,29 @@ test_that("custom authorization headers are supported and redacted", {
   })
   transport <- HttpTransport$new(
     "https://example.com",
-    headers = c(Authorization = "Basic custom-secret")
+    headers = c(
+      Authorization = "Basic custom-secret",
+      `X-API-Context` = "context-secret"
+    )
   )
 
   transport$emit(http_transport_event())
 
   request <- captured$request
-  printed_request <- capture.output(print(request))
-  headers <- .ol_http_request_headers(
-    NULL,
-    c(Authorization = "Basic custom-secret")
-  )
-  expect_identical(headers[["Authorization"]], "Basic custom-secret")
-  expect_named(request$headers, "Authorization")
+  printed_request <- paste(capture.output(print(request)), collapse = "\n")
   expect_identical(
-    grepl("custom-secret", paste(printed_request, collapse = "\n")),
+    httr2::req_get_headers(request, "reveal"),
+    list(
+      Authorization = "Basic custom-secret",
+      `X-API-Context` = "context-secret"
+    )
+  )
+  expect_identical(grepl("custom-secret", printed_request, fixed = TRUE), FALSE)
+  expect_identical(
+    grepl("context-secret", printed_request, fixed = TRUE),
     FALSE
   )
+  expect_match(printed_request, "X-API-Context", fixed = TRUE)
 })
 
 test_that("HTTP transport printing does not expose credentials", {
@@ -269,6 +255,7 @@ test_that("only approved HTTP statuses are retried", {
   statuses <- c(429L, 500L, 502L, 503L, 504L)
   status_code <- statuses[[1L]]
   attempts <- 0L
+  delays <- local_recorded_sleep()
   httr2::local_mocked_responses(function(req) {
     attempts <<- attempts + 1L
     if (attempts == 1L) {
@@ -290,10 +277,12 @@ test_that("only approved HTTP statuses are retried", {
 
     expect_identical(attempts, 2L, info = as.character(status))
   }
+  expect_identical(delays(), rep(0, length(statuses)))
 })
 
 test_that("HTTP retries are bounded", {
   attempts <- 0L
+  delays <- local_recorded_sleep()
   httr2::local_mocked_responses(function(req) {
     attempts <<- attempts + 1L
     http_mock_response(
@@ -310,6 +299,7 @@ test_that("HTTP retries are bounded", {
   )
 
   expect_identical(attempts, 3L)
+  expect_identical(delays(), c(0, 0))
   expect_s3_class(condition, "openlineage_http_error")
   expect_s3_class(condition, "openlineage_transport_error")
   expect_identical(condition$status_code, 503L)
@@ -321,6 +311,7 @@ test_that("HTTP retries are bounded", {
 
 test_that("non-transient HTTP errors are not retried", {
   attempts <- 0L
+  delays <- local_recorded_sleep()
   httr2::local_mocked_responses(function(req) {
     attempts <<- attempts + 1L
     http_mock_response(408L, req)
@@ -333,11 +324,13 @@ test_that("non-transient HTTP errors are not retried", {
   )
 
   expect_identical(attempts, 1L)
+  expect_identical(delays(), numeric())
   expect_s3_class(condition, "openlineage_http_error")
   expect_identical(condition$status_code, 408L)
 })
 
 test_that("authentication failures are classified and never retried", {
+  local_recorded_sleep()
   statuses <- c(401L, 403L)
   status_code <- statuses[[1L]]
   attempts <- 0L
@@ -402,15 +395,9 @@ test_that("chained authentication failures contain no credential trace", {
 
 test_that("low-level failures retry and then succeed", {
   attempts <- 0L
-  delays <- numeric()
+  delays <- local_recorded_sleep()
   failure <- simpleError("private low-level detail")
   class(failure) <- c("httr2_failure", "httr2_error", class(failure))
-  testthat::local_mocked_bindings(
-    .ol_http_retry_sleep = function(seconds) {
-      delays <<- c(delays, seconds)
-    },
-    .package = "openlineage"
-  )
   httr2::local_mocked_responses(function(req) {
     attempts <<- attempts + 1L
     if (attempts == 1L) {
@@ -423,35 +410,394 @@ test_that("low-level failures retry and then succeed", {
   transport$emit(http_transport_event())
 
   expect_identical(attempts, 2L)
-  expect_identical(delays, 1)
+  expect_identical(delays(), 1)
 })
 
-test_that("exhausted low-level failures are sanitized", {
-  failure_detail <- "private low-level failure detail"
-  failure <- simpleError(failure_detail)
-  class(failure) <- c("httr2_failure", "httr2_error", class(failure))
+test_that("exhausted low-level failures keep their cause, not credentials (#26)", {
+  local_recorded_sleep()
+  request_secret <- "private-request-secret"
   httr2::local_mocked_responses(function(req) {
+    cause <- structure(
+      list(message = "Could not resolve host: example.com", call = NULL),
+      class = c(
+        "curl_error_couldnt_resolve_host",
+        "curl_error",
+        "error",
+        "condition"
+      )
+    )
+    failure <- structure(
+      list(
+        message = "Failed to perform HTTP request.",
+        call = NULL,
+        parent = cause,
+        request = req
+      ),
+      class = c(
+        "httr2_failure",
+        "httr2_error",
+        "rlang_error",
+        "error",
+        "condition"
+      )
+    )
     stop(failure)
   })
-  transport <- HttpTransport$new("https://example.com", max_retries = 0L)
+  transport <- HttpTransport$new(
+    "https://example.com",
+    api_key = request_secret,
+    headers = c(`X-API-Context` = request_secret),
+    max_retries = 0L
+  )
 
   condition <- tryCatch(
     transport$emit(http_transport_event()),
     error = identity
   )
+  rendered <- paste(capture.output(str(condition)), collapse = "\n")
 
   expect_s3_class(condition, "openlineage_transport_error")
+  expect_null(condition$status_code)
+  expect_s3_class(condition$parent, "curl_error_couldnt_resolve_host")
+  expect_identical(
+    conditionMessage(condition$parent),
+    "Could not resolve host: example.com"
+  )
+  expect_null(condition$parent$request)
+  expect_identical(grepl(request_secret, rendered, fixed = TRUE), FALSE)
+  expect_snapshot(error = TRUE, transport$emit(http_transport_event()))
+})
+
+test_that("redirects are not followed and raise a classed error (#21)", {
+  local_recorded_sleep()
+  for (status in c(301L, 302L, 303L, 307L, 308L)) {
+    attempts <- 0L
+    httr2::local_mocked_responses(function(req) {
+      attempts <<- attempts + 1L
+      http_mock_response(
+        status,
+        req,
+        headers = list(Location = "https://elsewhere.example.com/moved")
+      )
+    })
+    transport <- HttpTransport$new(
+      "https://example.com",
+      headers = c(`X-Api-Key` = "secret"),
+      max_retries = 3L
+    )
+
+    condition <- tryCatch(
+      transport$emit(http_transport_event()),
+      error = identity
+    )
+
+    expect_identical(attempts, 1L, info = as.character(status))
+    expect_s3_class(condition, "openlineage_http_error")
+    expect_identical(condition$status_code, status)
+  }
+  expect_snapshot(error = TRUE, transport$emit(http_transport_event()))
+})
+
+test_that("Retry-After seconds are capped at 60 and clamped at 0 (#32)", {
+  cases <- list(
+    list(header = "59", delay = 59),
+    list(header = "60", delay = 60),
+    list(header = "61", delay = 60),
+    list(header = "-5", delay = 0),
+    list(header = " 2 ", delay = 2)
+  )
+
+  for (case in cases) {
+    expect_identical(
+      retry_delays(list(status_with(`Retry-After` = case$header))),
+      case$delay,
+      info = case$header
+    )
+  }
+})
+
+test_that("Retry-After dates are measured from Date, else now (#26, #32)", {
+  date <- "Wed, 18 Nov 2026 14:48:30 GMT"
+
+  expect_identical(
+    retry_delays(list(status_with(
+      `Retry-After` = date,
+      Date = "Wed, 18 Nov 2026 14:48:00 GMT"
+    ))),
+    30
+  )
+  expect_identical(
+    retry_delays(list(status_with(
+      `Retry-After` = date,
+      Date = "Wed, 18 Nov 2026 14:46:00 GMT"
+    ))),
+    60
+  )
+
+  testthat::local_mocked_bindings(
+    .ol_http_now = function() as.POSIXct("2026-11-18 14:48:20", tz = "UTC"),
+    .package = "openlineage"
+  )
+  expect_identical(retry_delays(list(status_with(`Retry-After` = date))), 10)
+})
+
+test_that("unreadable Retry-After falls back to back-off without warning (#49)", {
+  for (header in c("soon", "Wed, 18 Foo 2026 14:48:30 GMT", "")) {
+    expect_no_warning(
+      delays <- retry_delays(list(status_with(`Retry-After` = header)))
+    )
+    expect_identical(delays, 1, info = header)
+  }
+})
+
+test_that("back-off doubles from 1 s and is capped at 30 s (#32)", {
+  responses <- rep(list(status_with()), 7L)
+
+  expect_identical(retry_delays(responses), c(1, 2, 4, 8, 16, 30, 30))
+})
+
+test_that("timeout is bounded at construction (#27)", {
+  for (timeout in c(0.001, 1, 2147483)) {
+    expect_no_error(HttpTransport$new("https://example.com", timeout = timeout))
+  }
+  for (timeout in list(
+    0.000999,
+    0,
+    -1,
+    2147483.001,
+    Inf,
+    NA_real_,
+    "5",
+    c(1, 2)
+  )) {
+    expect_error(
+      HttpTransport$new("https://example.com", timeout = timeout),
+      class = "openlineage_config_error"
+    )
+  }
+  expect_snapshot(
+    error = TRUE,
+    HttpTransport$new("https://example.com", timeout = 1e-5)
+  )
+})
+
+test_that("URL and endpoint values that change the path are rejected (#28)", {
+  cases <- list(
+    list(url = "http://host/?"),
+    list(url = "http://host#"),
+    list(url = "http://host/a?b"),
+    list(url = "http://ho st"),
+    list(url = "http://host/a/../b"),
+    list(url = "http://host/a/%2E%2e/b"),
+    list(url = "http://host", endpoint = "api/%2e%2e/admin"),
+    list(url = "http://host", endpoint = "api/%2E/lineage"),
+    list(url = "http://host", endpoint = "a b"),
+    list(url = "http://host", endpoint = "a\tb"),
+    list(url = "http://host", endpoint = "a\001b")
+  )
+
+  for (case in cases) {
+    expect_error(
+      do.call(HttpTransport$new, case),
+      class = "openlineage_config_error",
+      info = paste(unlist(case), collapse = " ")
+    )
+  }
+  expect_snapshot(
+    error = TRUE,
+    HttpTransport$new("http://host", endpoint = "api/%2e%2e/admin")
+  )
+  expect_snapshot(
+    error = TRUE,
+    HttpTransport$new("http://host", endpoint = "a b")
+  )
+})
+
+test_that("a lone CR or LF in a header value is rejected (#36)", {
+  for (value in c("a\nb", "a\rb", "a\r\nb")) {
+    expect_error(
+      HttpTransport$new("https://example.com", headers = c(`X-Test` = value)),
+      class = "openlineage_config_error"
+    )
+  }
+})
+
+test_that("printing names the authentication kind (#36)", {
+  custom <- capture.output(
+    print(HttpTransport$new("https://example.com", headers = c(`X-A` = "s")))
+  )
+  none <- capture.output(print(HttpTransport$new("https://example.com")))
+
+  expect_match(
+    custom,
+    "authentication: custom headers",
+    fixed = TRUE,
+    all = FALSE
+  )
+  expect_match(none, "authentication: none", fixed = TRUE, all = FALSE)
+})
+
+test_that("a serialization failure in emit() sends nothing and keeps its cause (#26, #36)", {
+  attempts <- 0L
+  httr2::local_mocked_responses(function(req) {
+    attempts <<- attempts + 1L
+    http_mock_response(204L, req)
+  })
+  event <- RunEvent(
+    Run(
+      fixture_run_id(),
+      facets = list(custom = ol_facet("https://example.com/x.json", v = Inf))
+    ),
+    Job("example", "http-transport-test"),
+    event_time = "2026-01-02T03:04:05.000Z"
+  )
+
+  condition <- tryCatch(
+    HttpTransport$new("https://example.com")$emit(event),
+    error = identity
+  )
+
+  expect_identical(attempts, 0L)
+  expect_s3_class(condition, "openlineage_validation_error")
+  expect_s3_class(condition$parent, "openlineage_validation_error")
   expect_identical(
     conditionMessage(condition),
-    "OpenLineage HTTP request failed before receiving a response."
+    conditionMessage(condition$parent)
+  )
+})
+
+test_that("httr2 is told not to judge transient responses itself (#61)", {
+  captured <- new.env(parent = emptyenv())
+  httr2::local_mocked_responses(function(req) {
+    captured$request <- req
+    http_mock_response(204L, req)
+  })
+
+  HttpTransport$new("https://example.com")$emit(http_transport_event())
+
+  # The mock bypasses httr2's retry machinery, so assert the policy that
+  # stops httr2 from parsing `Retry-After` on a real 429 or 503.
+  policies <- captured$request$policies
+  response <- httr2::response(
+    503L,
+    headers = list(`Retry-After` = "Wed, 18 Nov 2026 14:48:30 GMT")
+  )
+  expect_identical(policies$retry_max_tries, 1)
+  expect_false(policies$retry_is_transient(response))
+  expect_false(isTRUE(policies$retry_on_failure))
+})
+
+test_that("framing and routing headers are rejected (#62)", {
+  names <- c(
+    "Content-Length",
+    "content-length",
+    "Transfer-Encoding",
+    "Host",
+    "Connection",
+    "Expect",
+    "TE",
+    "Trailer",
+    "Upgrade"
+  )
+
+  for (name in names) {
+    expect_error(
+      HttpTransport$new(
+        "https://example.com",
+        headers = stats::setNames("5", name)
+      ),
+      class = "openlineage_config_error",
+      info = name
+    )
+  }
+  expect_snapshot(
+    error = TRUE,
+    HttpTransport$new(
+      "https://example.com",
+      headers = c(`Content-Length` = "5")
+    )
+  )
+})
+
+test_that("invalid header names are rejected (#69)", {
+  for (name in c("Bad Header", "X:Y", "X\nY", "é", "")) {
+    expect_error(
+      HttpTransport$new(
+        "https://example.com",
+        headers = stats::setNames("v", name)
+      ),
+      class = "openlineage_config_error",
+      info = name
+    )
+  }
+  expect_error(
+    HttpTransport$new("https://example.com", headers = c("v")),
+    class = "openlineage_config_error"
+  )
+})
+
+test_that("Retry-After accepts all three HTTP-date forms (#67)", {
+  date <- "Wed, 18 Nov 2026 14:48:00 GMT"
+  forms <- c(
+    "Wed, 18 Nov 2026 14:48:30 GMT",
+    "Wednesday, 18-Nov-26 14:48:30 GMT",
+    "Wed Nov 18 14:48:30 2026"
+  )
+
+  for (form in forms) {
+    expect_identical(
+      retry_delays(list(status_with(`Retry-After` = form, Date = date))),
+      30,
+      info = form
+    )
+  }
+  expect_identical(
+    retry_delays(list(status_with(
+      `Retry-After` = "Wed, 18 Nov 2026 14:48:30 GMT",
+      Date = "Wednesday, 18-Nov-26 14:48:20 GMT"
+    ))),
+    10
   )
   expect_identical(
-    grepl(
-      failure_detail,
-      paste(capture.output(str(condition)), collapse = "\n"),
-      fixed = TRUE
-    ),
-    FALSE
+    retry_delays(list(status_with(
+      `Retry-After` = "Sun Nov  8 00:00:10 2026",
+      Date = "Sun, 08 Nov 2026 00:00:00 GMT"
+    ))),
+    10
   )
-  expect_snapshot(error = TRUE, transport$emit(http_transport_event()))
+})
+
+test_that("RFC 850 two-digit years more than 50 years ahead are past (#67)", {
+  testthat::local_mocked_bindings(
+    .ol_http_now = function() as.POSIXct("2026-11-18", tz = "UTC"),
+    .package = "openlineage"
+  )
+
+  expect_identical(
+    format(.ol_http_parse_date("Sunday, 06-Nov-94 08:49:37 GMT")),
+    "1994-11-06 08:49:37"
+  )
+  expect_identical(
+    format(.ol_http_parse_date("Monday, 06-Nov-76 08:49:37 GMT")),
+    "2076-11-06 08:49:37"
+  )
+  expect_identical(
+    format(.ol_http_parse_date("Tuesday, 06-Nov-77 08:49:37 GMT")),
+    "1977-11-06 08:49:37"
+  )
+})
+
+test_that("impossible HTTP dates fall back to back-off (#67)", {
+  for (header in c(
+    "Wed, 31 Feb 2026 14:48:30 GMT",
+    "Wed, 18 Nov 2026 25:00:00 GMT",
+    "Wednesday, 31-Feb-26 14:48:30 GMT",
+    "Wed Feb 31 14:48:30 2026"
+  )) {
+    expect_identical(
+      retry_delays(list(status_with(`Retry-After` = header))),
+      1,
+      info = header
+    )
+  }
 })

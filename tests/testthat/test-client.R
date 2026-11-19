@@ -1,42 +1,5 @@
-client_test_event <- function(state = "START") {
-  RunEvent(
-    Run(fixture_run_id()),
-    Job("example", "client-test"),
-    event_type = state,
-    event_time = "2026-01-02T03:04:05.000Z"
-  )
-}
-
-client_mock_response <- function(status_code, request) {
-  httr2::response(
-    status_code = status_code,
-    url = request$url,
-    method = "POST"
-  )
-}
-
-client_local_env <- function(values = character()) {
-  variables <- .OPENLINEAGE_CLIENT_ENV_VARS
-  old <- Sys.getenv(variables, unset = NA_character_)
-  names(old) <- variables
-
-  Sys.unsetenv(variables)
-  if (length(values) > 0L) {
-    do.call(Sys.setenv, as.list(values))
-  }
-
-  function() {
-    Sys.unsetenv(variables)
-    present <- !is.na(old)
-    if (any(present)) {
-      do.call(Sys.setenv, as.list(old[present]))
-    }
-  }
-}
-
 test_that("client emits through an injected transport", {
-  restore_env <- client_local_env()
-  on.exit(restore_env())
+  local_client_env()
   transport <- AccumulatingTransport$new()
   client <- OpenLineageClient$new(transport = transport)
   event <- client_test_event()
@@ -51,8 +14,7 @@ test_that("client emits through an injected transport", {
 })
 
 test_that("client validates events before calling a custom transport", {
-  restore_env <- client_local_env()
-  on.exit(restore_env())
+  local_client_env()
   received <- new.env(parent = emptyenv())
   PermissiveTransport <- R6::R6Class(
     "PermissiveTransport",
@@ -69,8 +31,7 @@ test_that("client validates events before calling a custom transport", {
 })
 
 test_that("client defaults to console delivery without HTTP configuration", {
-  restore_env <- client_local_env()
-  on.exit(restore_env())
+  local_client_env()
 
   client <- OpenLineageClient$new()
   output <- paste(capture.output(print(client)), collapse = "\n")
@@ -80,44 +41,38 @@ test_that("client defaults to console delivery without HTTP configuration", {
 })
 
 test_that("client emits through an injected console transport", {
-  restore_env <- client_local_env()
-  on.exit(restore_env())
+  local_client_env()
   output <- character()
   stream <- textConnection("output", "w", local = TRUE)
   on.exit(close(stream), add = TRUE)
   client <- OpenLineageClient$new(
     transport = ConsoleTransport$new(stream, pretty = FALSE)
   )
-  event <- client_test_event()
+  event <- minimal_start_event()
 
   result <- withVisible(client$emit(event))
 
   expect_length(output, 1L)
-  expect_json_semantically_equal(output, to_openlineage_json(event))
+  expect_json_semantically_equal(
+    output,
+    read_json_fixture("minimal-start.json")
+  )
   expect_identical(result$value, event)
   expect_identical(result$visible, FALSE)
 })
 
 test_that("client emits through an explicitly configured HTTP transport", {
-  restore_env <- client_local_env(c(
+  local_client_env(c(
     OPENLINEAGE_URL = "https://environment.example.com",
     OPENLINEAGE_ENDPOINT = "environment/lineage",
     OPENLINEAGE_API_KEY = "environment-key",
     OPENLINEAGE_DISABLED = "true"
   ))
-  on.exit(restore_env())
   captured <- new.env(parent = emptyenv())
   keys <- character()
-  original_headers <- .ol_http_request_headers
-  testthat::local_mocked_bindings(
-    .ol_http_request_headers = function(api_key, headers) {
-      keys <<- c(keys, api_key)
-      original_headers(api_key, headers)
-    },
-    .package = "openlineage"
-  )
   httr2::local_mocked_responses(function(req) {
     captured$request <- req
+    keys <<- c(keys, sent_authorization(req))
     client_mock_response(204L, req)
   })
   client <- OpenLineageClient$new(
@@ -134,29 +89,21 @@ test_that("client emits through an explicitly configured HTTP transport", {
     captured$request$url,
     "https://explicit.example.com/base/custom/lineage"
   )
-  expect_identical(keys, "explicit-key")
+  expect_identical(keys, "Bearer explicit-key")
 })
 
 test_that("client configures HTTP from environment variables", {
-  restore_env <- client_local_env(c(
+  local_client_env(c(
     OPENLINEAGE_URL = "https://environment.example.com/base/",
     OPENLINEAGE_ENDPOINT = "/events/lineage/",
     OPENLINEAGE_API_KEY = "environment-key",
     OPENLINEAGE_DISABLED = " false "
   ))
-  on.exit(restore_env())
   captured <- new.env(parent = emptyenv())
   keys <- character()
-  original_headers <- .ol_http_request_headers
-  testthat::local_mocked_bindings(
-    .ol_http_request_headers = function(api_key, headers) {
-      keys <<- c(keys, api_key)
-      original_headers(api_key, headers)
-    },
-    .package = "openlineage"
-  )
   httr2::local_mocked_responses(function(req) {
     captured$request <- req
+    keys <<- c(keys, sent_authorization(req))
     client_mock_response(201L, req)
   })
   client <- OpenLineageClient$new()
@@ -168,15 +115,14 @@ test_that("client configures HTTP from environment variables", {
     captured$request$url,
     "https://environment.example.com/base/events/lineage"
   )
-  expect_identical(keys, "environment-key")
+  expect_identical(keys, "Bearer environment-key")
 })
 
 test_that("an explicit endpoint overrides the environment endpoint", {
-  restore_env <- client_local_env(c(
+  local_client_env(c(
     OPENLINEAGE_URL = "https://example.com",
     OPENLINEAGE_ENDPOINT = "environment/lineage"
   ))
-  on.exit(restore_env())
   captured <- new.env(parent = emptyenv())
   httr2::local_mocked_responses(function(req) {
     captured$request <- req
@@ -193,11 +139,10 @@ test_that("an explicit endpoint overrides the environment endpoint", {
 })
 
 test_that("disabled configuration selects no-op delivery", {
-  restore_env <- client_local_env(c(
+  local_client_env(c(
     OPENLINEAGE_URL = "https://example.com",
     OPENLINEAGE_DISABLED = " TRUE "
   ))
-  on.exit(restore_env())
   transport <- AccumulatingTransport$new()
 
   environment_disabled <- OpenLineageClient$new(transport = transport)
@@ -216,8 +161,7 @@ test_that("disabled configuration selects no-op delivery", {
 })
 
 test_that("invalid and conflicting client settings are rejected", {
-  restore_env <- client_local_env()
-  on.exit(restore_env())
+  local_client_env()
   transport <- AccumulatingTransport$new()
 
   expect_snapshot(error = TRUE, OpenLineageClient$new(disabled = NA))
@@ -242,18 +186,16 @@ test_that("invalid and conflicting client settings are rejected", {
 })
 
 test_that("invalid disabled environment values are rejected", {
-  restore_env <- client_local_env(c(OPENLINEAGE_DISABLED = "yes"))
-  on.exit(restore_env())
+  local_client_env(c(OPENLINEAGE_DISABLED = "yes"))
 
   expect_snapshot(error = TRUE, OpenLineageClient$new())
 })
 
 test_that("partial HTTP environment configuration requires a URL", {
-  restore_env <- client_local_env(c(
+  local_client_env(c(
     OPENLINEAGE_ENDPOINT = "orphan/lineage",
     OPENLINEAGE_API_KEY = "environment-secret"
   ))
-  on.exit(restore_env())
   condition <- tryCatch(OpenLineageClient$new(), error = identity)
   rendered <- paste(capture.output(str(condition)), collapse = "\n")
 
@@ -275,13 +217,12 @@ test_that("partial HTTP environment configuration requires a URL", {
 })
 
 test_that("injected transports ignore HTTP environment variables", {
-  restore_env <- client_local_env(c(
+  local_client_env(c(
     OPENLINEAGE_URL = "not a URL",
     OPENLINEAGE_ENDPOINT = "../invalid",
     OPENLINEAGE_API_KEY = "environment-secret",
     OPENLINEAGE_DISABLED = "false"
   ))
-  on.exit(restore_env())
   transport <- AccumulatingTransport$new()
   client <- OpenLineageClient$new(transport = transport)
 
@@ -292,8 +233,7 @@ test_that("injected transports ignore HTTP environment variables", {
 })
 
 test_that("clients keep accumulating transport state independent", {
-  restore_env <- client_local_env()
-  on.exit(restore_env())
+  local_client_env()
   first <- OpenLineageClient$new(
     transport = AccumulatingTransport$new()
   )
@@ -317,26 +257,18 @@ test_that("clients keep accumulating transport state independent", {
 })
 
 test_that("clients capture credentials independently at construction", {
-  restore_env <- client_local_env(c(
+  local_client_env(c(
     OPENLINEAGE_URL = "https://example.com",
     OPENLINEAGE_API_KEY = "first-client-secret"
   ))
-  on.exit(restore_env())
   first <- OpenLineageClient$new()
-  Sys.setenv(OPENLINEAGE_API_KEY = "second-client-secret")
+  withr::local_envvar(OPENLINEAGE_API_KEY = "second-client-secret")
   second <- OpenLineageClient$new()
   keys <- character()
-  original_headers <- .ol_http_request_headers
-  testthat::local_mocked_bindings(
-    .ol_http_request_headers = function(api_key, headers) {
-      keys <<- c(keys, api_key)
-      original_headers(api_key, headers)
-    },
-    .package = "openlineage"
-  )
-  httr2::local_mocked_responses(
-    \(req) client_mock_response(204L, req)
-  )
+  httr2::local_mocked_responses(function(req) {
+    keys <<- c(keys, sent_authorization(req))
+    client_mock_response(204L, req)
+  })
 
   first$emit(client_test_event())
   second$emit(client_test_event())
@@ -345,7 +277,7 @@ test_that("clients capture credentials independently at construction", {
 
   expect_identical(
     keys,
-    c("first-client-secret", "second-client-secret")
+    c("Bearer first-client-secret", "Bearer second-client-secret")
   )
   expect_identical(
     grepl("first-client-secret", first_structure, fixed = TRUE),
@@ -358,8 +290,7 @@ test_that("clients capture credentials independently at construction", {
 })
 
 test_that("client configuration conditions contain no credentials", {
-  restore_env <- client_local_env()
-  on.exit(restore_env())
+  local_client_env()
   condition <- tryCatch(
     OpenLineageClient$new(
       transport = AccumulatingTransport$new(),
@@ -375,4 +306,184 @@ test_that("client configuration conditions contain no credentials", {
     grepl("literal-client-secret", rendered, fixed = TRUE),
     FALSE
   )
+})
+
+test_that("transport = rejects every explicit HTTP argument (#34)", {
+  local_client_env()
+  arguments <- list(
+    url = "https://example.com",
+    endpoint = "custom/lineage",
+    api_key = "key",
+    headers = c(`X-Tenant` = "analytics"),
+    timeout = 10,
+    verify_tls = FALSE,
+    max_retries = 0L
+  )
+
+  for (name in names(arguments)) {
+    call_args <- c(
+      list(transport = AccumulatingTransport$new()),
+      arguments[name]
+    )
+    condition <- tryCatch(
+      do.call(OpenLineageClient$new, call_args),
+      error = identity
+    )
+    expect_s3_class(condition, "openlineage_config_error")
+    expect_match(conditionMessage(condition), name, fixed = TRUE, info = name)
+  }
+})
+
+test_that("transport = conflicts are errors when the client is disabled (#34)", {
+  local_client_env(c(OPENLINEAGE_DISABLED = "true"))
+
+  expect_error(
+    OpenLineageClient$new(
+      transport = AccumulatingTransport$new(),
+      url = "https://x",
+      api_key = "k",
+      disabled = TRUE
+    ),
+    class = "openlineage_config_error"
+  )
+  expect_error(
+    OpenLineageClient$new(
+      transport = AccumulatingTransport$new(),
+      url = "https://x"
+    ),
+    class = "openlineage_config_error"
+  )
+  expect_s3_class(
+    OpenLineageClient$new(transport = AccumulatingTransport$new())$transport,
+    "NoopTransport"
+  )
+})
+
+test_that("blank environment values count as unset (#36)", {
+  local_client_env(c(
+    OPENLINEAGE_URL = "https://example.com",
+    OPENLINEAGE_ENDPOINT = "  ",
+    OPENLINEAGE_API_KEY = " "
+  ))
+  captured <- new.env(parent = emptyenv())
+  httr2::local_mocked_responses(function(req) {
+    captured$request <- req
+    client_mock_response(204L, req)
+  })
+
+  OpenLineageClient$new()$emit(client_test_event())
+
+  expect_identical(captured$request$url, "https://example.com/api/v1/lineage")
+  expect_null(sent_authorization(captured$request))
+})
+
+test_that("close() delegates to the transport (#47)", {
+  local_client_env()
+  calls <- 0L
+  ClosingTransport <- R6::R6Class(
+    "ClosingTransport",
+    public = list(
+      emit = function(event) invisible(event),
+      close = function() {
+        calls <<- calls + 1L
+        "closed"
+      }
+    )
+  )
+  EmitOnlyTransport <- R6::R6Class(
+    "EmitOnlyTransport",
+    public = list(emit = function(event) invisible(event))
+  )
+
+  closing <- OpenLineageClient$new(transport = ClosingTransport$new())
+  result <- withVisible(closing$close())
+  emit_only <- withVisible(
+    OpenLineageClient$new(transport = EmitOnlyTransport$new())$close()
+  )
+  built_in <- OpenLineageClient$new(transport = AccumulatingTransport$new())
+
+  expect_identical(calls, 1L)
+  expect_identical(result, list(value = "closed", visible = FALSE))
+  expect_identical(emit_only, list(value = TRUE, visible = FALSE))
+  expect_true(built_in$close())
+  expect_true(OpenLineageClient$new(disabled = TRUE)$close())
+})
+
+test_that("the client forwards every HTTP argument (#68)", {
+  local_client_env()
+  requests <- list()
+  httr2::local_mocked_responses(function(req) {
+    requests[[length(requests) + 1L]] <<- req
+    client_mock_response(503L, req)
+  })
+  testthat::local_mocked_bindings(
+    .ol_http_retry_sleep = function(seconds) NULL,
+    .package = "openlineage"
+  )
+  expect_warning(
+    client <- OpenLineageClient$new(
+      url = "https://example.com",
+      endpoint = "custom/lineage",
+      headers = c(`X-Tenant` = "a"),
+      timeout = 2.5,
+      verify_tls = FALSE,
+      max_retries = 0L
+    ),
+    class = "openlineage_insecure_tls_warning"
+  )
+
+  # With the default of 3 retries the 503 would be sent four times.
+  expect_error(
+    client$emit(client_test_event()),
+    class = "openlineage_http_error"
+  )
+
+  expect_length(requests, 1L)
+  request <- requests[[1L]]
+  expect_identical(request$url, "https://example.com/custom/lineage")
+  expect_identical(
+    httr2::req_get_headers(request, "reveal"),
+    list(`X-Tenant` = "a")
+  )
+  expect_identical(request$options$timeout_ms, 2500)
+  expect_identical(request$options$ssl_verifypeer, 0)
+})
+
+test_that("close() raises classed conditions (#66)", {
+  local_client_env()
+  FailingTransport <- R6::R6Class(
+    "FailingTransport",
+    public = list(
+      emit = function(event) invisible(event),
+      close = function() stop("boom")
+    )
+  )
+  NonFunctionClose <- R6::R6Class(
+    "NonFunctionClose",
+    public = list(emit = function(event) invisible(event), close = "x")
+  )
+
+  failing <- OpenLineageClient$new(transport = FailingTransport$new())
+  condition <- tryCatch(failing$close(), error = identity)
+  expect_s3_class(condition, "openlineage_transport_error")
+  expect_identical(conditionMessage(condition$parent), "boom")
+  expect_true(
+    OpenLineageClient$new(transport = NonFunctionClose$new())$close()
+  )
+
+  broken <- OpenLineageClient$new(transport = AccumulatingTransport$new())
+  broken$transport <- "x"
+  expect_error(broken$close(), class = "openlineage_config_error")
+})
+
+test_that("closing twice and emitting after close are no-ops for built-ins (#66)", {
+  local_client_env()
+  transport <- AccumulatingTransport$new()
+  client <- OpenLineageClient$new(transport = transport)
+
+  expect_true(client$close())
+  expect_true(client$close())
+  client$emit(client_test_event())
+
+  expect_length(transport$events, 1L)
 })
